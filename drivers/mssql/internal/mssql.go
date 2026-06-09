@@ -23,15 +23,17 @@ import (
 )
 
 type MSSQL struct {
-	client        *sqlx.DB
-	config        *Config
-	state         *types.State
-	capturesMap   map[string][]captureInstance
-	lsnMap        sync.Map
-	streams       []types.StreamInterface
-	cdcSupported  bool
-	isReadReplica bool
-	sshClient     *ssh.Client
+	client           *sqlx.DB
+	primaryClient    *sqlx.DB
+	config           *Config
+	state            *types.State
+	capturesMap      map[string][]captureInstance
+	lsnMap           sync.Map
+	streams          []types.StreamInterface
+	cdcSupported     bool
+	isReadReplica    bool
+	sshClient        *ssh.Client
+	primarySSHClient *ssh.Client
 }
 
 // GetConfigRef implements abstract.DriverInterface.
@@ -54,55 +56,67 @@ func (m *MSSQL) CDCSupported() bool {
 	return m.cdcSupported
 }
 
-// Setup establishes the database connection and initialises CDC settings.
-func (m *MSSQL) Setup(ctx context.Context) error {
-	if err := m.config.Validate(); err != nil {
-		return fmt.Errorf("failed to validate config: %s", err)
-	}
+func openMSSQLConnection(ctx context.Context, connStr string, host string, sshConfig *utils.SSHConfig, maxConns int) (*sqlx.DB, *ssh.Client, error) {
 
-	if m.config.SSHConfig != nil && m.config.SSHConfig.Host != "" {
-		logger.Info("Found SSH Configuration")
+	var sshClient *ssh.Client
+
+	if sshConfig != nil && sshConfig.Host != "" {
 		var err error
-		m.sshClient, err = m.config.SSHConfig.SetupSSHConnection()
+		sshClient, err = sshConfig.SetupSSHConnection()
+
 		if err != nil {
-			return fmt.Errorf("failed to setup SSH connection: %s", err)
+			return nil, nil, fmt.Errorf("failed to setup SSH connection: %s", err)
 		}
 	}
 
 	var client *sqlx.DB
-	connStr := m.config.URI()
 
-	if m.sshClient != nil {
+	if sshClient != nil {
 		logger.Info("Connecting to MSSQL via SSH tunnel")
 
 		connector, err := mssql.NewConnector(connStr)
 		if err != nil {
-			return fmt.Errorf("failed to create MSSQL connector: %s", err)
+			return nil, nil, fmt.Errorf("failed to create MSSQL connector: %s", err)
 		}
 
-		connector.Dialer = &mssqlSSHDialer{sshClient: m.sshClient, host: m.config.Host}
+		connector.Dialer = &mssqlSSHDialer{sshClient: sshClient, host: host}
 
 		db := sql.OpenDB(connector)
 		client = sqlx.NewDb(db, "sqlserver")
 	} else {
 		db, err := sql.Open("sqlserver", connStr)
 		if err != nil {
-			return fmt.Errorf("failed to open MSSQL connection: %s", err)
+			return nil, nil, fmt.Errorf("failed to open MSSQL connection: %s", err)
 		}
 		client = sqlx.NewDb(db, "sqlserver")
 	}
 
 	// Set connection pool size
-	client.SetMaxOpenConns(m.config.MaxThreads)
+	client.SetMaxOpenConns(maxConns)
 
 	// Test connection
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := client.PingContext(ctx); err != nil {
-		return fmt.Errorf("failed to ping database: %s", err)
+	if err := client.PingContext(pingCtx); err != nil {
+		return nil, sshClient, fmt.Errorf("failed to ping database: %s", err)
+	}
+
+	return client, sshClient, nil
+}
+
+// Setup establishes the database connection and initialises CDC settings.
+func (m *MSSQL) Setup(ctx context.Context) error {
+	if err := m.config.Validate(); err != nil {
+		return fmt.Errorf("failed to validate config: %s", err)
+	}
+
+	client, sshClient, err := openMSSQLConnection(ctx, m.config.URI(), m.config.Host, m.config.SSHConfig, m.config.MaxThreads)
+	if err != nil {
+		return fmt.Errorf("failed to setup MSSQL connection: %s", err)
 	}
 
 	m.client = client
+	m.sshClient = sshClient
 	m.config.RetryCount = utils.Ternary(m.config.RetryCount <= 0, 1, m.config.RetryCount+1).(int)
 	// Enable CDC support if database-level CDC is enabled
 	cdcSupported, err := m.isDatabaseCDCEnabled(ctx)
@@ -116,7 +130,20 @@ func (m *MSSQL) Setup(ctx context.Context) error {
 
 	m.isReadReplica = m.detectReadReplica(ctx)
 	if m.isReadReplica {
-		logger.Info("Connected to a read-only MSSQL replica; CDC capture instance management is disabled and agent catch-up wait will be skipped")
+		if m.config.PrimaryConfig != nil {
+			// user has chose to provide info for primary along with the replica hence proceeding ahead with a connection to primary
+			primaryClient, primarySSH, err := openMSSQLConnection(ctx, m.config.PrimaryURI(), m.config.PrimaryConfig.Host, m.config.PrimaryConfig.SSHConfig, 1)
+			if err != nil {
+				return fmt.Errorf("failed to setup primary MSSQL connection: %s", err)
+			}
+
+			m.primaryClient = primaryClient
+			m.primarySSHClient = primarySSH
+
+			logger.Info("Connected to a read-only MSSQL replica and establishing connection to Primary; CDC capture instance management and agent catch-up wait will use Primary connection")
+		} else {
+			logger.Info("Connected to a read-only MSSQL replica; CDC capture instance management is disabled and agent catch-up wait will be skipped")
+		}
 	}
 	return nil
 }
@@ -146,6 +173,19 @@ func (m *MSSQL) Close() error {
 	if m.sshClient != nil {
 		if err := m.sshClient.Close(); err != nil {
 			logger.Errorf("failed to close SSH client: %s", err)
+		}
+	}
+
+	if m.primaryClient != nil {
+		err := m.primaryClient.Close()
+		if err != nil {
+			logger.Errorf("failed to close primary connection with MSSQL: %s", err)
+		}
+	}
+
+	if m.primarySSHClient != nil {
+		if err := m.primarySSHClient.Close(); err != nil {
+			logger.Errorf("failed to close primary SSH client: %s", err)
 		}
 	}
 
