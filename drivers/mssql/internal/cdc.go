@@ -237,14 +237,14 @@ func (m *MSSQL) manageCaptureInstances(ctx context.Context, streamIDs []string, 
 
 	// Read replicas are read-only; sp_cdc_enable_table / sp_cdc_disable_table require
 	// write access to the primary.
-	if m.isReadReplica {
+	if m.isReadReplica && m.primaryClient == nil {
 		logger.Debug("manage_capture_instances is enabled but the connection targets a read-only replica; capture instance management is skipped")
 		return nil
 	}
 
 	// Fetch DDL history for all streams in bulk
 	ddlHistoryQuery := jdbc.MSSQLCDCGetDDLHistoryBulkQuery(streamIDs)
-	rows, err := m.client.QueryContext(ctx, ddlHistoryQuery)
+	rows, err := m.cdcClientManager().QueryContext(ctx, ddlHistoryQuery)
 	if err != nil {
 		return fmt.Errorf("failed to query bulk DDL history: %w", err)
 	}
@@ -287,7 +287,7 @@ func (m *MSSQL) manageCaptureInstances(ctx context.Context, streamIDs []string, 
 		for idx, capture := range instances {
 			if idx != activeIdx && (currentCursorLSN == "" || capture.startLSN <= currentCursorLSN) {
 				query := jdbc.MSSQLCDCDisableCaptureInstanceQuery()
-				_, err := m.client.ExecContext(ctx, query, capture.schema, capture.table, capture.instanceName)
+				_, err := m.cdcClientManager().ExecContext(ctx, query, capture.schema, capture.table, capture.instanceName)
 				if err != nil {
 					return fmt.Errorf("failed to delete obsolete capture instance %s for %s: %w", capture.instanceName, streamID, err)
 				}
@@ -311,7 +311,7 @@ func (m *MSSQL) manageCaptureInstances(ctx context.Context, streamIDs []string, 
 				newInstanceName := fmt.Sprintf("olake_%s_%d", streamPart, time.Now().Unix())
 
 				createCaptureInstanceQuery := jdbc.MSSQLCDCCreateCaptureInstanceQuery()
-				_, err := m.client.ExecContext(ctx, createCaptureInstanceQuery, latestCapture.schema, latestCapture.table, newInstanceName)
+				_, err := m.cdcClientManager().ExecContext(ctx, createCaptureInstanceQuery, latestCapture.schema, latestCapture.table, newInstanceName)
 				if err != nil {
 					return fmt.Errorf("failed to create new capture instance for schema drift on %s: %w", streamID, err)
 				}
@@ -407,6 +407,7 @@ func (m *MSSQL) fetchTableChangesInLSNRange(ctx context.Context, stream types.St
 
 func (m *MSSQL) currentMaxLSN(ctx context.Context) (string, error) {
 	var lsn []byte
+	// since this is just reading changes we can keep using replica instead of primary if available
 	err := m.client.QueryRowContext(ctx, jdbc.MSSQLCDCMaxLSNQuery()).Scan(&lsn)
 	if err != nil {
 		return "", err
@@ -477,13 +478,15 @@ func operationTypeFromCDCCode(code int32) string {
 // current max LSN directly, accepting that the initial CDC window may overlap with the backfill
 // snapshot. Any resulting duplicates are handled by OLake's deduplication logic (in upsert mode).
 func (m *MSSQL) resolveInitialLSN(ctx context.Context) (string, error) {
-	if m.isReadReplica {
+	//this updated method now uses primary for resolving init lsn if connected to primary client
+	if m.isReadReplica && m.primaryClient == nil {
 		logger.Debug("Skipping CDC agent catch-up wait on read replica; reading current max LSN directly")
 		return m.currentMaxLSN(ctx)
 	}
 
+	//if we have primary available use it for LSN resolution
 	var hasPermission bool
-	err := m.client.QueryRowContext(ctx, jdbc.MSSQLViewDatabaseStatePermissionQuery()).Scan(&hasPermission)
+	err := m.cdcClientManager().QueryRowContext(ctx, jdbc.MSSQLViewDatabaseStatePermissionQuery()).Scan(&hasPermission)
 	if err != nil {
 		return "", fmt.Errorf("failed to check VIEW DATABASE STATE permission: %s", err)
 	}
@@ -506,7 +509,7 @@ func (m *MSSQL) waitForCDCAgentCatchUp(ctx context.Context) (string, error) {
 		maxTrans         int
 		pollingIntervalS int
 	)
-	err := m.client.QueryRowContext(ctx, jdbc.MSSQLCDCCaptureJobConfigQuery()).Scan(&maxTrans, &pollingIntervalS)
+	err := m.cdcClientManager().QueryRowContext(ctx, jdbc.MSSQLCDCCaptureJobConfigQuery()).Scan(&maxTrans, &pollingIntervalS)
 	if err != nil {
 		return "", fmt.Errorf("unable to query CDC capture job config: %s", err)
 	}
@@ -560,7 +563,7 @@ func (m *MSSQL) waitForCDCAgentCatchUp(ctx context.Context) (string, error) {
 // latestCDCScanSession returns the most recent completed CDC log scan session.
 // The boolean return value indicates whether a completed session exists.
 func (m *MSSQL) latestCDCScanSession(ctx context.Context) (session cdcScanSession, found bool, err error) {
-	err = m.client.QueryRowContext(ctx, jdbc.MSSQLCDCLatestScanSessionQuery()).Scan(&session.sessionID, &session.endTime, &session.tranCount)
+	err = m.cdcClientManager().QueryRowContext(ctx, jdbc.MSSQLCDCLatestScanSessionQuery()).Scan(&session.sessionID, &session.endTime, &session.tranCount)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return cdcScanSession{}, false, nil

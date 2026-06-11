@@ -56,6 +56,7 @@ func (m *MSSQL) CDCSupported() bool {
 	return m.cdcSupported
 }
 
+// a helper method for setting things up. Works for both primary and seconday db
 func openMSSQLConnection(ctx context.Context, connStr string, host string, sshConfig *utils.SSHConfig, maxConns int) (*sqlx.DB, *ssh.Client, error) {
 
 	var sshClient *ssh.Client
@@ -363,4 +364,13 @@ func (m *MSSQL) isDatabaseCDCEnabled(ctx context.Context) (bool, error) {
 	}
 
 	return isEnabled, nil
+}
+
+func (m *MSSQL) cdcClientManager() *sqlx.DB {
+	if m.primaryClient != nil {
+		return m.primaryClient
+	}
+
+	return m.client
+
 }
