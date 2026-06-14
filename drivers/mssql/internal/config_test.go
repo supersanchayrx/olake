@@ -7,6 +7,7 @@ import (
 
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/testutils"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestConfig_Validate(t *testing.T) {
@@ -135,6 +136,96 @@ func TestConfig_Validate(t *testing.T) {
 			},
 			expectErr: true,
 		},
+		{
+			//valid config with a primary config
+			name: "valid config - with primary config",
+			config: &Config{
+				Host:     "mssql-host",
+				Port:     1433,
+				Database: "testDb",
+				Username: "sa",
+				Password: "Password!123",
+				PrimaryConfig: &PrimaryConfig{
+					Host:     "mssql-host-primary",
+					Port:     1433,
+					Username: "saa",
+					Password: "Password!12345",
+				},
+			},
+			expectErr: false,
+		},
+		{
+			//not valid config with primary config's host as empty
+			name: "invalid config - missing primary config host",
+			config: &Config{
+				Host:     "mssql-host",
+				Port:     1433,
+				Database: "testDb",
+				Username: "sa",
+				Password: "Password!123",
+				PrimaryConfig: &PrimaryConfig{
+					Host:     "",
+					Port:     1433,
+					Username: "saa",
+					Password: "Password!12345",
+				},
+			},
+			expectErr: true,
+		},
+		{
+			//not valid config with primary config's invalid port number
+			name: "invalid config - invalid primary config port",
+			config: &Config{
+				Host:     "mssql-host",
+				Port:     1433,
+				Database: "testDb",
+				Username: "sa",
+				Password: "Password!123",
+				PrimaryConfig: &PrimaryConfig{
+					Host:     "mssql-host-primary",
+					Port:     -1,
+					Username: "saa",
+					Password: "Password!12345",
+				},
+			},
+			expectErr: true,
+		},
+		{
+			//not valid config with primary config's username as empty
+			name: "invalid config - missing primary config username",
+			config: &Config{
+				Host:     "mssql-host",
+				Port:     1433,
+				Database: "testDb",
+				Username: "sa",
+				Password: "Password!123",
+				PrimaryConfig: &PrimaryConfig{
+					Host:     "mssql-host-primary",
+					Port:     1433,
+					Username: "",
+					Password: "Password!12345",
+				},
+			},
+			expectErr: true,
+		},
+		{
+			//not valid config with primary config's password as empty
+			name: "invalid config - missing primary config password",
+			config: &Config{
+				Host:     "mssql-host",
+				Port:     1433,
+				Database: "testDb",
+				Username: "sa",
+				Password: "Password!123",
+				PrimaryConfig: &PrimaryConfig{
+					Host:     "mssql-host-primary",
+					Port:     1433,
+					Username: "mssql-host-primary",
+					Password: "",
+				},
+			},
+			expectErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -148,6 +239,41 @@ func TestConfig_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfig_PrimaryURI(t *testing.T) {
+	config := &Config{
+		Host:     "replica-host",
+		Port:     1433,
+		Database: "testdb",
+		Username: "replica-user",
+		Password: "ReplicaPass!123",
+		PrimaryConfig: &PrimaryConfig{
+			Host:     "primary-host",
+			Port:     1444,
+			Username: "primary-user",
+			Password: "PrimaryPass!123",
+		},
+	}
+
+	asserts := assert.New(t)
+	err := config.Validate()
+
+	asserts.Nil(err)
+
+	uri := config.PrimaryURI()
+
+	//should use primary config's host and port
+	asserts.Contains(uri, "primary-host:1444")
+	//should use primary config's username
+	asserts.Contains(uri, "primary-user")
+	//should use normal db
+	//should use normal db
+	asserts.Contains(uri, "database=testdb")
+
+	//should not have replica config info
+	asserts.NotContains(uri, "replica-host")
+	asserts.NotContains(uri, "replica-user")
 }
 
 func TestConfig_URI(t *testing.T) {
@@ -338,4 +464,63 @@ func TestConfig_SSHConfigDeserialization(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfig_PrimaryConfigDeserialization(t *testing.T) {
+	asserts := assert.New(t)
+
+	jsonData := `{
+		"host": "replica-host",
+		"port": 1433,
+		"database": "testdb",
+		"username": "sa",
+		"password": "Password!123",
+		"primary_config": {
+			"host": "primary-host",
+			"port": 1444,
+			"username": "primary-sa",
+			"password": "PrimaryPass!123"
+		}
+	}`
+
+	var config Config
+	err := json.Unmarshal([]byte(jsonData), &config)
+	asserts.NoError(err)
+	asserts.NotNil(config.PrimaryConfig)
+	asserts.Equal("primary-host", config.PrimaryConfig.Host)
+	asserts.Equal(1444, config.PrimaryConfig.Port)
+	asserts.Equal(config.PrimaryConfig.Username, "primary-sa")
+	asserts.Equal(config.PrimaryConfig.Password, "PrimaryPass!123")
+
+}
+
+func TestConfig_SSHPrimaryConfigDeserialization(t *testing.T) {
+	asserts := assert.New(t)
+
+	jsonData := `{
+		"host": "replica-host",
+    	"port": 1433,
+    	"database": "testdb",
+    	"username": "sa",
+    	"password": "Password!123",
+    	"primary_config": {
+        	"host": "primary-host",
+        	"port": 1444,
+        	"username": "primary-sa",
+        	"password": "PrimaryPass!123",
+        	"ssh_config": {
+        	    "host": "primary-host-sshUser",
+        	    "port": 22,
+        	    "username": "sshuser",
+        	    "password": "sshpass"
+        	}
+    	}
+	}`
+
+	var config Config
+	err := json.Unmarshal([]byte(jsonData), &config)
+	asserts.NoError(err)
+	asserts.Equal("primary-host-sshUser", config.PrimaryConfig.SSHConfig.Host)
+	asserts.Equal(config.PrimaryConfig.SSHConfig.Port, 22)
+
 }
